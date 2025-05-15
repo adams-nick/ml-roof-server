@@ -4,7 +4,9 @@ from typing import List, Dict, Any, Optional
 import numpy as np
 import time
 import cv2
-from shapely.geometry import Polygon
+from shapely.geometry import Polygon, Point
+from sklearn.cluster import KMeans
+from scipy import ndimage
 
 from app.models.sam_model import SamModel
 from app.utils.image_utils import decode_base64_image, mask_to_polygon, calculate_area
@@ -129,9 +131,14 @@ def simplify_polygon(polygon, tolerance=2.0, max_points=8):
         current_tolerance = tolerance
         simplified = None
         
-        # Using the built-in simplify method instead of importing shapely.simplify
+        # Using the built-in simplify method from shapely
         while True:
             simplified = shapely_poly.simplify(current_tolerance, preserve_topology=True)
+            
+            # Check if simplification resulted in a MultiPolygon
+            if simplified.geom_type == 'MultiPolygon':
+                # Take the largest polygon from the MultiPolygon
+                simplified = max(simplified.geoms, key=lambda g: g.area)
             
             # Check number of points in the simplified polygon
             num_points = len(list(simplified.exterior.coords)) - 1  # -1 because first/last points are the same
@@ -270,6 +277,175 @@ def resolve_overlaps_simple(segments):
             {**s, 'polygon': s['polygon']} for s in segments if 'shapely_polygon' in s
         ]
 
+def extract_dominant_colors(rgb_image, mask, num_colors=3):
+    """
+    Extract the dominant colors from a masked region of an image.
+    
+    Args:
+        rgb_image: RGB image as numpy array
+        mask: Binary mask of the region to analyze
+        num_colors: Number of dominant colors to extract
+        
+    Returns:
+        List of (color, percentage) tuples where color is (r,g,b) and percentage is 0-1
+    """
+    try:
+        # Apply mask to the image
+        masked_pixels = []
+        for y in range(rgb_image.shape[0]):
+            for x in range(rgb_image.shape[1]):
+                if mask[y, x] > 0:
+                    masked_pixels.append(rgb_image[y, x])
+        
+        if not masked_pixels:
+            return []
+            
+        masked_pixels = np.array(masked_pixels)
+        
+        # Use K-means to find dominant colors
+        kmeans = KMeans(n_clusters=min(num_colors, len(masked_pixels)), random_state=42, n_init=10)
+        kmeans.fit(masked_pixels)
+        
+        # Get the colors and their percentages
+        colors = kmeans.cluster_centers_.astype(int)
+        labels = kmeans.labels_
+        
+        # Count pixels assigned to each cluster
+        counts = np.bincount(labels)
+        percentages = counts / len(masked_pixels)
+        
+        # Sort by frequency (most frequent first)
+        sorted_indices = np.argsort(percentages)[::-1]
+        
+        return [(tuple(colors[i]), percentages[i]) for i in sorted_indices]
+    except Exception as e:
+        print(f"Error extracting dominant colors: {e}")
+        return []
+
+def detect_color_anomalies(rgb_image, mask, dominant_color, threshold_factor=1.5):
+    """
+    Detect color anomalies within a segment based on deviation from dominant color.
+    
+    Args:
+        rgb_image: RGB image as numpy array
+        mask: Binary mask of the segment
+        dominant_color: (r,g,b) tuple of the dominant color
+        threshold_factor: Multiplier for the threshold (higher = less sensitive)
+        
+    Returns:
+        List of bounding boxes for detected anomalies
+    """
+    try:
+        # Convert to proper data types
+        mask = mask.astype(np.uint8)
+        dc = np.array(dominant_color, dtype=np.float32)
+        
+        # Create a color distance map
+        distance_map = np.zeros(mask.shape, dtype=np.float32)
+        
+        # Get masked image region
+        masked_img = rgb_image.copy()
+        masked_img[mask == 0] = [0, 0, 0]
+        
+        # Calculate Euclidean distance from dominant color for each pixel
+        for y in range(rgb_image.shape[0]):
+            for x in range(rgb_image.shape[1]):
+                if mask[y, x] > 0:
+                    pixel = rgb_image[y, x].astype(np.float32)
+                    distance = np.sqrt(np.sum((pixel - dc)**2))
+                    distance_map[y, x] = distance
+        
+        # Get statistics of the distances within the mask
+        masked_distances = distance_map[mask > 0]
+        if len(masked_distances) == 0:
+            return []
+            
+        mean_distance = np.mean(masked_distances)
+        std_distance = np.std(masked_distances)
+        
+        # Threshold at mean + threshold_factor * std
+        threshold = mean_distance + threshold_factor * std_distance
+        
+        # Create anomaly mask
+        anomaly_mask = np.zeros_like(mask)
+        anomaly_mask[distance_map > threshold] = 1
+        anomaly_mask = anomaly_mask * mask  # Keep only within segment
+        
+        # Clean up with morphological operations
+        kernel = np.ones((3, 3), np.uint8)
+        anomaly_mask = cv2.morphologyEx(anomaly_mask, cv2.MORPH_OPEN, kernel)
+        anomaly_mask = cv2.morphologyEx(anomaly_mask, cv2.MORPH_CLOSE, kernel)
+        
+        # Find connected components
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(anomaly_mask)
+        
+        # Filter components by size
+        min_size = 10  # Minimum anomaly size in pixels
+        max_size = int(0.25 * np.sum(mask))  # Maximum 25% of segment
+        
+        anomaly_boxes = []
+        for i in range(1, num_labels):  # Skip background (0)
+            size = stats[i, cv2.CC_STAT_AREA]
+            
+            if size < min_size or size > max_size:
+                continue
+                
+            # Get bounding box
+            x = stats[i, cv2.CC_STAT_LEFT]
+            y = stats[i, cv2.CC_STAT_TOP]
+            w = stats[i, cv2.CC_STAT_WIDTH]
+            h = stats[i, cv2.CC_STAT_HEIGHT]
+            
+            # Add some margin
+            margin_x = max(2, int(0.1 * w))
+            margin_y = max(2, int(0.1 * h))
+            
+            x1 = max(0, x - margin_x)
+            y1 = max(0, y - margin_y)
+            x2 = min(rgb_image.shape[1] - 1, x + w + margin_x)
+            y2 = min(rgb_image.shape[0] - 1, y + h + margin_y)
+            
+            anomaly_boxes.append({
+                'min_x': float(x1),
+                'min_y': float(y1),
+                'max_x': float(x2),
+                'max_y': float(y2),
+                'area': float(size)
+            })
+        
+        return anomaly_boxes
+    except Exception as e:
+        print(f"Error detecting color anomalies: {e}")
+        return []
+
+def polygon_to_mask(polygon, shape):
+    """
+    Convert polygon coordinates to a binary mask
+    
+    Args:
+        polygon: List of points [{'x': x, 'y': y}, ...]
+        shape: (height, width) tuple for the mask shape
+        
+    Returns:
+        Binary mask as numpy array
+    """
+    try:
+        mask = np.zeros(shape, dtype=np.uint8)
+        
+        if not polygon or len(polygon) < 3:
+            return mask
+            
+        # Extract points
+        points = np.array([[p['x'], p['y']] for p in polygon], dtype=np.int32)
+        
+        # Fill polygon
+        cv2.fillPoly(mask, [points], 1)
+        
+        return mask
+    except Exception as e:
+        print(f"Error converting polygon to mask: {e}")
+        return np.zeros(shape, dtype=np.uint8)
+
 @router.post("/predict")
 async def predict_roof_segments(request: PredictionRequest):
     global sam_model
@@ -300,16 +476,49 @@ async def predict_roof_segments(request: PredictionRequest):
         # Set the image for the model
         sam_model.set_image(rgb_image)
         
-        # Initialize the segment collection
+        # Initialize results collections
         all_roof_segments = []
+        all_obstructions = []
         
-        # Only process if roof segments are provided
+        # Get building box area for significance calculations
+        building_area = 0
+        if request.building_box:
+            building_area = (request.building_box.max_x - request.building_box.min_x) * \
+                            (request.building_box.max_y - request.building_box.min_y)
+        
+        # STEP 1: Sort roof segments by area and process them
         if request.roof_segments and len(request.roof_segments) > 0:
             print(f"Using {len(request.roof_segments)} roof segments as prompts")
             
-            # Process each roof segment as a separate prompt
+            # Calculate area for each roof segment
+            roof_segments_with_area = []
             for segment in request.roof_segments:
                 segment_id = segment.id if segment.id else f"segment_{id(segment)}"
+                segment_area = (segment.max_x - segment.min_x) * (segment.max_y - segment.min_y)
+                significance = segment_area / building_area if building_area > 0 else 1.0
+                
+                roof_segments_with_area.append({
+                    'segment': segment,
+                    'area': segment_area,
+                    'significance': significance,
+                    'id': segment_id
+                })
+            
+            # Sort by area (largest first)
+            roof_segments_with_area.sort(key=lambda s: s['area'], reverse=True)
+            
+            # Store all dominant colors for later comparison
+            all_dominant_colors = []
+            
+            # Process each roof segment in order of size
+            for seg_info in roof_segments_with_area:
+                segment = seg_info['segment']
+                segment_id = seg_info['id']
+                
+                # Skip if significance is too low (less than 1% of building area)
+                if seg_info['significance'] < 0.01 and building_area > 0:
+                    print(f"Skipping segment {segment_id} due to low significance ({seg_info['significance']:.2f})")
+                    continue
                 
                 # Create box prompt for this segment
                 box_prompt = np.array([
@@ -348,9 +557,33 @@ async def predict_roof_segments(request: PredictionRequest):
                 mask, score = select_best_mask(masks, scores, box_prompt, rgb_image.shape[:2])
                 
                 if mask is not None:
+                    # Extract dominant colors from this mask
+                    dominant_colors = extract_dominant_colors(rgb_image, mask, num_colors=2)
+                    
+                    if dominant_colors:
+                        primary_color, primary_percentage = dominant_colors[0]
+                        
+                        # Check if this color is unique compared to already stored colors
+                        color_is_unique = True
+                        for color, _ in all_dominant_colors:
+                            # Calculate color distance
+                            distance = np.sqrt(np.sum((np.array(primary_color) - np.array(color))**2))
+                            if distance < 50:  # Threshold for similar colors
+                                color_is_unique = False
+                                break
+                        
+                        # If this is a small segment with a unique color, it might be an obstruction
+                        if color_is_unique and seg_info['significance'] < 0.1 and len(all_dominant_colors) > 0:
+                            print(f"Skipping segment {segment_id} as potential obstruction (unique color)")
+                            continue
+                        
+                        # Store this color for future comparison
+                        all_dominant_colors.append((primary_color, primary_percentage))
+                    
+                    # Convert mask to polygon
                     polygon = mask_to_polygon(mask)
                     
-                    if polygon:
+                    if polygon and len(polygon) >= 3:
                         # Simplify the polygon to use straight lines and fewer points
                         simplified_polygon = simplify_polygon(polygon, tolerance=2.0, max_points=8)
                         
@@ -368,6 +601,17 @@ async def predict_roof_segments(request: PredictionRequest):
                                 'azimuth': segment_azimuth,
                                 'pitch': segment_pitch,
                             }
+                            
+                            # Store mask as a separate attribute
+                            segment_result['_mask'] = mask
+                            
+                            if dominant_colors:
+                                segment_result['dominant_color'] = {
+                                    'r': int(primary_color[0]),
+                                    'g': int(primary_color[1]),
+                                    'b': int(primary_color[2]),
+                                    'percentage': float(primary_percentage)
+                                }
                             
                             # Add group information if applicable
                             if is_group:
@@ -414,8 +658,117 @@ async def predict_roof_segments(request: PredictionRequest):
                         'error': 'No valid masks generated by model'
                     })
             
+            # STEP 2: Detect and segment obstructions within each valid roof segment
+            print("Starting obstruction detection phase")
+            
+            obstruction_id_counter = 0
+            for segment in all_roof_segments:
+                # Skip segments without valid polygons or masks
+                if not segment.get('polygon') or len(segment.get('polygon', [])) < 3 or '_mask' not in segment:
+                    continue
+                
+                mask = segment['_mask']
+                
+                # Get dominant color for this segment
+                dominant_color = None
+                if 'dominant_color' in segment:
+                    dominant_color = (
+                        segment['dominant_color']['r'],
+                        segment['dominant_color']['g'],
+                        segment['dominant_color']['b']
+                    )
+                else:
+                    # If no dominant color stored, extract it from the mask
+                    colors = extract_dominant_colors(rgb_image, mask, num_colors=1)
+                    if colors:
+                        dominant_color = colors[0][0]
+                
+                if dominant_color is None:
+                    continue
+                
+                # Detect color anomalies within this segment
+                anomaly_boxes = detect_color_anomalies(
+                    rgb_image, 
+                    mask, 
+                    dominant_color,
+                    threshold_factor=1.5  # Adjust sensitivity as needed
+                )
+                
+                print(f"Detected {len(anomaly_boxes)} potential obstructions in segment {segment['id']}")
+                
+                # Process each anomaly with SAM to get precise segmentation
+                for anomaly_box in anomaly_boxes:
+                    obstruction_id_counter += 1
+                    obstruction_id = f"obstruction_{obstruction_id_counter}"
+                    
+                    # Create box prompt for this obstruction
+                    box_prompt = np.array([
+                        anomaly_box['min_x'], 
+                        anomaly_box['min_y'], 
+                        anomaly_box['max_x'], 
+                        anomaly_box['max_y']
+                    ])
+                    
+                    try:
+                        # Predict with the box prompt
+                        masks, scores, _ = sam_model.predict(box=box_prompt)
+                        
+                        # Take the highest confidence mask
+                        if len(masks) > 0:
+                            best_idx = np.argmax(scores)
+                            obstruction_mask = masks[best_idx]
+                            score = scores[best_idx]
+                            
+                            # Make sure the obstruction mask is contained within the segment mask
+                            obstruction_mask = np.logical_and(obstruction_mask, mask).astype(np.uint8)
+                            
+                            if np.sum(obstruction_mask) == 0:
+                                continue  # Skip if no overlap with segment
+                            
+                            # Convert mask to polygon
+                            polygon = mask_to_polygon(obstruction_mask)
+                            
+                            if polygon and len(polygon) >= 3:
+                                # Simplify the polygon
+                                simplified_polygon = simplify_polygon(polygon, tolerance=1.5, max_points=12)
+                                
+                                # Calculate area
+                                area = calculate_area(simplified_polygon)
+                                
+                                # Add to obstructions list if large enough
+                                if area > 10:  # Smaller threshold for obstructions
+                                    all_obstructions.append({
+                                        'id': obstruction_id,
+                                        'polygon': simplified_polygon,
+                                        'area': area,
+                                        'confidence': float(score),
+                                        'is_obstruction': True,
+                                        'parent_segment': segment['id']
+                                    })
+                    except Exception as e:
+                        print(f"Error processing obstruction {obstruction_id}: {e}")
+            
+            # STEP 3: Mark roof segments with obstructions and remove obstruction masks from roof segments
+            print("Finalizing roof segments and removing obstructions")
+            
+            for segment in all_roof_segments:
+                # Find obstructions belonging to this segment
+                segment_obstructions = [o for o in all_obstructions if o.get('parent_segment') == segment.get('id')]
+                
+                if segment_obstructions:
+                    segment['has_obstruction'] = True
+                    segment['obstruction_count'] = len(segment_obstructions)
+                    
+                    # Clean up segment polygon by removing obstructions
+                    # This will be handled by resolve_overlaps_simple
+            
             # Resolve overlaps between segments
             all_roof_segments = resolve_overlaps_simple(all_roof_segments)
+            
+            # Remove masks from final output - we don't need to send them back
+            for segment in all_roof_segments:
+                if '_mask' in segment:
+                    del segment['_mask']
         
         # Calculate processing time
         processing_time = time.time() - start_time
@@ -424,11 +777,14 @@ async def predict_roof_segments(request: PredictionRequest):
         return {
             "building_id": request.building_id,
             "roof_segments": all_roof_segments,
+            "obstructions": all_obstructions,
             "status": "success",
             "processing_time_seconds": processing_time,
             "num_segments": len(all_roof_segments),
+            "num_obstructions": len(all_obstructions),
             "used_roof_segments": request.roof_segments is not None and len(request.roof_segments) > 0,
-            "used_building_box": False  # Never using building box now
+            "used_building_box": request.building_box is not None,
+            "used_color_analysis": True
         }
     except Exception as e:
         # Log the full error details
