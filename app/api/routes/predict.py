@@ -27,6 +27,8 @@ class BoundingBox(BaseModel):
     id: Optional[str] = None
     azimuth: Optional[float] = None
     pitch: Optional[float] = None
+    orientation: Optional[str] = None
+    suitability: Optional[float] = None
     is_group: Optional[bool] = False
     member_ids: Optional[List[str]] = None
     member_count: Optional[int] = None
@@ -56,10 +58,11 @@ class PredictionRequest(BaseModel):
     class Config:
         extra = "allow"
 
-def select_best_mask(masks, scores, box_prompt, image_shape):
+def select_best_mask(masks, scores, box_prompt, image_shape, segment_properties=None):
     """
     Select the best mask that represents a roof face rather than negative space.
     Uses heuristics like intersection with box, area ratios, etc.
+    Now considers segment properties if available.
     """
     if masks is None or len(masks) == 0:
         return None, 0.0
@@ -92,12 +95,18 @@ def select_best_mask(masks, scores, box_prompt, image_shape):
             continue
             
         # Prefer masks that have high overlap with the box and reasonable size
-        if intersection_ratio > 0.7 and area_ratio < 1.5:
-            adjusted_score = original_score * (intersection_ratio + 0.5)
-            if adjusted_score > best_score:
-                best_score = adjusted_score
-                best_mask = mask
-                best_idx = i
+        adjusted_score = original_score * (intersection_ratio + 0.5)
+        
+        # If we have known roof properties, consider them for scoring
+        if segment_properties:
+            # Boost score based on suitability if available
+            if segment_properties.get('suitability') is not None:
+                adjusted_score *= (1.0 + segment_properties.get('suitability', 0.5))
+        
+        if adjusted_score > best_score:
+            best_score = adjusted_score
+            best_mask = mask
+            best_idx = i
     
     # If no good mask found with the above criteria, fallback to highest score mask
     if best_mask is None and len(masks) > 0:
@@ -291,7 +300,7 @@ def resolve_overlaps_simple(segments):
             {**s, 'polygon': s['polygon']} for s in segments if 'shapely_polygon' in s
         ]
 
-def calculate_elevation_anomalies(dsm_2d, mask, plane_params, threshold_factor=2.0):
+def calculate_elevation_anomalies(dsm_2d, mask, plane_params, threshold_factor=2.0, segment_properties=None):
     """
     Identify pixels that deviate significantly from the fitted plane
     
@@ -300,6 +309,7 @@ def calculate_elevation_anomalies(dsm_2d, mask, plane_params, threshold_factor=2
         mask: Binary mask of the roof segment
         plane_params: Parameters of the fitted plane (a, b, c) in z = ax + by + c
         threshold_factor: Multiplier for standard deviation threshold
+        segment_properties: Optional properties of the segment to customize detection
         
     Returns:
         Binary mask of anomalous pixels
@@ -316,18 +326,27 @@ def calculate_elevation_anomalies(dsm_2d, mask, plane_params, threshold_factor=2
         # Create a mask for anomalies
         anomaly_mask = np.zeros_like(mask, dtype=np.uint8)
         
-        # Print dimensions for debugging
-        print(f"DSM dimensions: {width}x{height}, Mask dimensions: {mask_width}x{mask_height}")
+        # Adjust threshold based on segment properties if available
+        adjusted_threshold = threshold_factor
+        if segment_properties:
+            # Steeper roofs may need different thresholds
+            if segment_properties.get('pitch') and segment_properties.get('pitch') > 30:
+                adjusted_threshold *= 0.8  # More sensitive for steep roofs
+            # Consider suitability if available
+            if segment_properties.get('suitability') and segment_properties.get('suitability') < 0.5:
+                adjusted_threshold *= 1.2  # Less sensitive for low suitability areas
         
-        # Calculate expected elevation for each point on the plane
-        residuals = []
-        residual_coords = []
+        print(f"Using anomaly threshold factor: {adjusted_threshold}")
         
         # Use the smaller of the dimensions to avoid index errors
         safe_height = min(height, mask_height)
         safe_width = min(width, mask_width)
         
         print(f"Using safe dimensions for analysis: {safe_width}x{safe_height}")
+        
+        # Calculate expected elevation for each point on the plane
+        residuals = []
+        residual_coords = []
         
         for y in range(safe_height):
             for x in range(safe_width):
@@ -354,7 +373,7 @@ def calculate_elevation_anomalies(dsm_2d, mask, plane_params, threshold_factor=2
         
         # Set threshold for anomalies
         # Positive threshold for elements that stick up from the roof
-        threshold = mean_residual + threshold_factor * std_residual
+        threshold = mean_residual + adjusted_threshold * std_residual
         
         print(f"Anomaly threshold: {threshold:.2f}")
         
@@ -713,12 +732,22 @@ async def predict_roof_segments(request: PredictionRequest):
                     segment.max_y
                 ])
                 
-                # Get segment metadata
+                # Get segment metadata including new properties
                 segment_azimuth = segment.azimuth
                 segment_pitch = segment.pitch
+                segment_orientation = segment.orientation if hasattr(segment, 'orientation') else None
+                segment_suitability = segment.suitability if hasattr(segment, 'suitability') else None
                 is_group = segment.is_group if segment.is_group is not None else False
                 member_count = segment.member_count if segment.member_count else 0
                 member_ids = segment.member_ids if segment.member_ids else []
+                
+                # Create properties dictionary for enhanced processing
+                segment_properties = {
+                    'pitch': segment_pitch,
+                    'azimuth': segment_azimuth,
+                    'orientation': segment_orientation,
+                    'suitability': segment_suitability
+                }
                 
                 # Add a center point prompt to help guide the model
                 center_x = (segment.min_x + segment.max_x) / 2
@@ -738,8 +767,8 @@ async def predict_roof_segments(request: PredictionRequest):
                     # Fallback to just box prompt
                     masks, scores, _ = sam_model.predict(box=box_prompt)
                 
-                # Select the best mask that represents a roof face (not negative space)
-                mask, score = select_best_mask(masks, scores, box_prompt, rgb_image.shape[:2])
+                # Select the best mask that represents a roof face (not negative space) - now with properties
+                mask, score = select_best_mask(masks, scores, box_prompt, rgb_image.shape[:2], segment_properties)
                 
                 if mask is not None:
                     # Convert mask to polygon
@@ -763,6 +792,12 @@ async def predict_roof_segments(request: PredictionRequest):
                                 'azimuth': segment_azimuth,
                                 'pitch': segment_pitch,
                             }
+                            
+                            # Add new properties if available
+                            if segment_orientation is not None:
+                                segment_result['orientation'] = segment_orientation
+                            if segment_suitability is not None:
+                                segment_result['suitability'] = segment_suitability
                             
                             # Store mask as a separate attribute for later use
                             segment_result['_mask'] = mask
@@ -825,6 +860,14 @@ async def predict_roof_segments(request: PredictionRequest):
                     segment_id = segment['id']
                     roof_mask = segment['_mask']
                     
+                    # Create properties dictionary for enhanced obstruction detection
+                    segment_properties = {
+                        'pitch': segment.get('pitch'),
+                        'azimuth': segment.get('azimuth'),
+                        'orientation': segment.get('orientation'),
+                        'suitability': segment.get('suitability')
+                    }
+                    
                     # Step 2.1: Extract DSM data for this roof segment
                     segment_dsm_data = extract_dsm_data_from_mask(
                         dsm_data, roof_mask, dsm_2d.shape[1], dsm_2d.shape[0])
@@ -850,9 +893,18 @@ async def predict_roof_segments(request: PredictionRequest):
                     segment['calculated_pitch'] = slope_info['slope_degrees']
                     segment['calculated_azimuth'] = slope_info['aspect_degrees']
                     
-                    # Step 2.4: Find elevation anomalies (potential obstructions)
+                    # Compare with provided values if available
+                    if segment.get('pitch') is not None and segment.get('azimuth') is not None:
+                        pitch_diff = abs(slope_info['slope_degrees'] - segment['pitch'])
+                        azimuth_diff = min(abs(slope_info['aspect_degrees'] - segment['azimuth']), 
+                                         360 - abs(slope_info['aspect_degrees'] - segment['azimuth']))
+                        
+                        print(f"Segment {segment_id}: Pitch difference: {pitch_diff:.1f}°, Azimuth difference: {azimuth_diff:.1f}°")
+                    
+                    # Step 2.4: Find elevation anomalies (potential obstructions) - now with properties
                     anomaly_mask = calculate_elevation_anomalies(
-                        dsm_2d, roof_mask, plane_params, threshold_factor=1.5)
+                        dsm_2d, roof_mask, plane_params, threshold_factor=2.0, 
+                        segment_properties=segment_properties)
                     
                     # Step 2.5: Find bounding boxes around anomalies
                     anomaly_boxes = find_anomaly_boxes(anomaly_mask)
