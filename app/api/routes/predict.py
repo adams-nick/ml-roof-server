@@ -4,9 +4,12 @@ from typing import List, Dict, Any, Optional
 import numpy as np
 import time
 import cv2
-from shapely.geometry import Polygon, Point
-from sklearn.cluster import KMeans
+from shapely.geometry import Polygon, Point, LineString
+from shapely.ops import unary_union
 from scipy import ndimage
+from scipy.stats import linregress
+import math
+import traceback
 
 from app.models.sam_model import SamModel
 from app.utils.image_utils import decode_base64_image, mask_to_polygon, calculate_area
@@ -32,11 +35,22 @@ class BoundingBox(BaseModel):
     class Config:
         extra = "allow"
 
+class DsmData(BaseModel):
+    elevationData: List[float]
+    dimensions: Dict[str, int]
+    dataRange: Optional[Dict[str, float]] = None
+    
+    class Config:
+        extra = "allow"
+
 class PredictionRequest(BaseModel):
     building_id: str
     rgb_image: str  # Base64 encoded image
     building_box: Optional[BoundingBox] = None
     roof_segments: Optional[List[BoundingBox]] = []
+    dsm_data: Optional[DsmData] = None
+    image_width: Optional[int] = None
+    image_height: Optional[int] = None
     
     # Allow additional fields
     class Config:
@@ -277,146 +291,102 @@ def resolve_overlaps_simple(segments):
             {**s, 'polygon': s['polygon']} for s in segments if 'shapely_polygon' in s
         ]
 
-def extract_dominant_colors(rgb_image, mask, num_colors=3):
+def calculate_elevation_anomalies(dsm_2d, mask, plane_params, threshold_factor=2.0):
     """
-    Extract the dominant colors from a masked region of an image.
+    Identify pixels that deviate significantly from the fitted plane
     
     Args:
-        rgb_image: RGB image as numpy array
-        mask: Binary mask of the region to analyze
-        num_colors: Number of dominant colors to extract
+        dsm_2d: 2D array of DSM elevation data
+        mask: Binary mask of the roof segment
+        plane_params: Parameters of the fitted plane (a, b, c) in z = ax + by + c
+        threshold_factor: Multiplier for standard deviation threshold
         
     Returns:
-        List of (color, percentage) tuples where color is (r,g,b) and percentage is 0-1
+        Binary mask of anomalous pixels
     """
-    try:
-        # Apply mask to the image
-        masked_pixels = []
-        for y in range(rgb_image.shape[0]):
-            for x in range(rgb_image.shape[1]):
-                if mask[y, x] > 0:
-                    masked_pixels.append(rgb_image[y, x])
-        
-        if not masked_pixels:
-            return []
-            
-        masked_pixels = np.array(masked_pixels)
-        
-        # Use K-means to find dominant colors
-        kmeans = KMeans(n_clusters=min(num_colors, len(masked_pixels)), random_state=42, n_init=10)
-        kmeans.fit(masked_pixels)
-        
-        # Get the colors and their percentages
-        colors = kmeans.cluster_centers_.astype(int)
-        labels = kmeans.labels_
-        
-        # Count pixels assigned to each cluster
-        counts = np.bincount(labels)
-        percentages = counts / len(masked_pixels)
-        
-        # Sort by frequency (most frequent first)
-        sorted_indices = np.argsort(percentages)[::-1]
-        
-        return [(tuple(colors[i]), percentages[i]) for i in sorted_indices]
-    except Exception as e:
-        print(f"Error extracting dominant colors: {e}")
-        return []
-
-def detect_color_anomalies(rgb_image, mask, dominant_color, threshold_factor=1.5):
-    """
-    Detect color anomalies within a segment based on deviation from dominant color.
+    if plane_params is None or len(plane_params) < 3:
+        print("Invalid plane parameters, returning empty anomaly mask")
+        return np.zeros_like(mask, dtype=np.uint8)
     
-    Args:
-        rgb_image: RGB image as numpy array
-        mask: Binary mask of the segment
-        dominant_color: (r,g,b) tuple of the dominant color
-        threshold_factor: Multiplier for the threshold (higher = less sensitive)
-        
-    Returns:
-        List of bounding boxes for detected anomalies
-    """
     try:
-        # Convert to proper data types
-        mask = mask.astype(np.uint8)
-        dc = np.array(dominant_color, dtype=np.float32)
+        a, b, c = plane_params
+        height, width = dsm_2d.shape
+        mask_height, mask_width = mask.shape
         
-        # Create a color distance map
-        distance_map = np.zeros(mask.shape, dtype=np.float32)
+        # Create a mask for anomalies
+        anomaly_mask = np.zeros_like(mask, dtype=np.uint8)
         
-        # Get masked image region
-        masked_img = rgb_image.copy()
-        masked_img[mask == 0] = [0, 0, 0]
+        # Print dimensions for debugging
+        print(f"DSM dimensions: {width}x{height}, Mask dimensions: {mask_width}x{mask_height}")
         
-        # Calculate Euclidean distance from dominant color for each pixel
-        for y in range(rgb_image.shape[0]):
-            for x in range(rgb_image.shape[1]):
+        # Calculate expected elevation for each point on the plane
+        residuals = []
+        residual_coords = []
+        
+        # Use the smaller of the dimensions to avoid index errors
+        safe_height = min(height, mask_height)
+        safe_width = min(width, mask_width)
+        
+        print(f"Using safe dimensions for analysis: {safe_width}x{safe_height}")
+        
+        for y in range(safe_height):
+            for x in range(safe_width):
                 if mask[y, x] > 0:
-                    pixel = rgb_image[y, x].astype(np.float32)
-                    distance = np.sqrt(np.sum((pixel - dc)**2))
-                    distance_map[y, x] = distance
+                    actual_elevation = dsm_2d[y, x]
+                    expected_elevation = a*x + b*y + c
+                    residual = actual_elevation - expected_elevation
+                    
+                    # Only include valid residuals (not NaN or infinity)
+                    if np.isfinite(residual):
+                        residuals.append(residual)
+                        residual_coords.append((x, y))
         
-        # Get statistics of the distances within the mask
-        masked_distances = distance_map[mask > 0]
-        if len(masked_distances) == 0:
-            return []
+        if not residuals:
+            print("No valid residuals found, returning empty anomaly mask")
+            return anomaly_mask
             
-        mean_distance = np.mean(masked_distances)
-        std_distance = np.std(masked_distances)
+        # Calculate statistics of residuals
+        residuals = np.array(residuals)
+        mean_residual = np.mean(residuals)
+        std_residual = np.std(residuals)
         
-        # Threshold at mean + threshold_factor * std
-        threshold = mean_distance + threshold_factor * std_distance
+        print(f"Residual statistics: mean={mean_residual:.2f}, std={std_residual:.2f}")
         
-        # Create anomaly mask
-        anomaly_mask = np.zeros_like(mask)
-        anomaly_mask[distance_map > threshold] = 1
-        anomaly_mask = anomaly_mask * mask  # Keep only within segment
+        # Set threshold for anomalies
+        # Positive threshold for elements that stick up from the roof
+        threshold = mean_residual + threshold_factor * std_residual
         
-        # Clean up with morphological operations
-        kernel = np.ones((3, 3), np.uint8)
-        anomaly_mask = cv2.morphologyEx(anomaly_mask, cv2.MORPH_OPEN, kernel)
-        anomaly_mask = cv2.morphologyEx(anomaly_mask, cv2.MORPH_CLOSE, kernel)
+        print(f"Anomaly threshold: {threshold:.2f}")
         
-        # Find connected components
-        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(anomaly_mask)
+        # Mark pixels that exceed the threshold
+        for i, (x, y) in enumerate(residual_coords):
+            if residuals[i] > threshold:
+                anomaly_mask[y, x] = 1
         
-        # Filter components by size
-        min_size = 10  # Minimum anomaly size in pixels
-        max_size = int(0.25 * np.sum(mask))  # Maximum 25% of segment
+        # Apply morphological operations to clean up the anomaly mask if it has any anomalies
+        anomaly_count = np.sum(anomaly_mask)
+        print(f"Found {anomaly_count} anomalous pixels before morphology")
         
-        anomaly_boxes = []
-        for i in range(1, num_labels):  # Skip background (0)
-            size = stats[i, cv2.CC_STAT_AREA]
+        if anomaly_count > 0:
+            kernel = np.ones((3, 3), np.uint8)
+            # Use try-except in case morphology operations fail
+            try:
+                # Opening (erosion followed by dilation) removes small isolated pixels
+                anomaly_mask = cv2.morphologyEx(anomaly_mask, cv2.MORPH_OPEN, kernel)
+                # Closing (dilation followed by erosion) fills small holes
+                anomaly_mask = cv2.morphologyEx(anomaly_mask, cv2.MORPH_CLOSE, kernel)
+                print(f"Anomaly count after morphology: {np.sum(anomaly_mask)}")
+            except Exception as morph_error:
+                print(f"Error during morphological operations: {morph_error}")
+                # Continue with the unprocessed mask if morphology fails
+                pass
             
-            if size < min_size or size > max_size:
-                continue
-                
-            # Get bounding box
-            x = stats[i, cv2.CC_STAT_LEFT]
-            y = stats[i, cv2.CC_STAT_TOP]
-            w = stats[i, cv2.CC_STAT_WIDTH]
-            h = stats[i, cv2.CC_STAT_HEIGHT]
-            
-            # Add some margin
-            margin_x = max(2, int(0.1 * w))
-            margin_y = max(2, int(0.1 * h))
-            
-            x1 = max(0, x - margin_x)
-            y1 = max(0, y - margin_y)
-            x2 = min(rgb_image.shape[1] - 1, x + w + margin_x)
-            y2 = min(rgb_image.shape[0] - 1, y + h + margin_y)
-            
-            anomaly_boxes.append({
-                'min_x': float(x1),
-                'min_y': float(y1),
-                'max_x': float(x2),
-                'max_y': float(y2),
-                'area': float(size)
-            })
-        
-        return anomaly_boxes
+        return anomaly_mask
+    
     except Exception as e:
-        print(f"Error detecting color anomalies: {e}")
-        return []
+        print(f"Error calculating elevation anomalies: {e}")
+        traceback.print_exc()  # Print full stack trace for debugging
+        return np.zeros_like(mask, dtype=np.uint8)
 
 def polygon_to_mask(polygon, shape):
     """
@@ -446,6 +416,192 @@ def polygon_to_mask(polygon, shape):
         print(f"Error converting polygon to mask: {e}")
         return np.zeros(shape, dtype=np.uint8)
 
+def extract_dsm_data_from_mask(dsm_array, mask, dsm_width, dsm_height):
+    """
+    Extract DSM elevation data for pixels inside a mask
+    """
+    # Create a 2D view of the DSM data
+    dsm_2d = np.array(dsm_array).reshape(dsm_height, dsm_width)
+    
+    # Check if mask dimensions match DSM dimensions, resize if necessary
+    if mask.shape[0] != dsm_height or mask.shape[1] != dsm_width:
+        # Convert boolean mask to uint8 before resizing (THIS IS THE FIX)
+        mask_uint8 = mask.astype(np.uint8) * 255
+        mask_resized = cv2.resize(mask_uint8, (dsm_width, dsm_height), interpolation=cv2.INTER_NEAREST)
+        # Convert back to binary mask after resizing
+        mask_resized = (mask_resized > 127).astype(np.uint8)
+    else:
+        mask_resized = mask.astype(np.uint8)  # Ensure consistent type
+    
+    # Extract coordinates and elevation values for pixels inside the mask
+    coords = []
+    elevations = []
+    
+    for y in range(dsm_height):
+        for x in range(dsm_width):
+            if mask_resized[y, x] > 0:
+                coords.append((x, y))
+                elevations.append(dsm_2d[y, x])
+    
+    return {
+        'coordinates': coords,
+        'elevations': elevations,
+        'count': len(coords)
+    }
+
+def fit_plane_to_points(points, elevations):
+    """
+    Fit a 3D plane to points with elevation data
+    
+    Args:
+        points: List of (x, y) coordinates
+        elevations: List of z values corresponding to points
+        
+    Returns:
+        Tuple of (plane_params, error) where plane_params is (a, b, c) in z = ax + by + c
+    """
+    if len(points) < 3:
+        return None, float('inf')
+    
+    try:
+        # Convert to numpy arrays
+        points_array = np.array(points)
+        elevations_array = np.array(elevations)
+        
+        # Filter out invalid values
+        valid_idx = ~np.isnan(elevations_array)
+        if np.sum(valid_idx) < 3:
+            return None, float('inf')
+            
+        points_array = points_array[valid_idx]
+        elevations_array = elevations_array[valid_idx]
+        
+        # Create A matrix for least squares fit
+        A = np.column_stack((points_array, np.ones(len(points_array))))
+        
+        # Solve for plane coefficients
+        plane_params, residuals, _, _ = np.linalg.lstsq(A, elevations_array, rcond=None)
+        
+        # Calculate error
+        error = residuals[0] if len(residuals) > 0 else float('inf')
+        
+        return plane_params, error
+    except Exception as e:
+        print(f"Error fitting plane to points: {e}")
+        return None, float('inf')
+
+def calculate_plane_slope(plane_params):
+    """
+    Calculate slope and aspect from plane parameters
+    
+    Args:
+        plane_params: Tuple of (a, b, c) in z = ax + by + c
+        
+    Returns:
+        Dictionary with slope in degrees and aspect (azimuth) in degrees
+    """
+    if plane_params is None or len(plane_params) < 3:
+        return {'slope_degrees': 0, 'aspect_degrees': 0}
+    
+    try:
+        a, b, c = plane_params
+        
+        # Calculate slope (angle from horizontal)
+        slope_radians = math.atan(math.sqrt(a*a + b*b))
+        slope_degrees = math.degrees(slope_radians)
+        
+        # Calculate aspect (direction of slope)
+        aspect_radians = math.atan2(-a, b)  # Negating a for proper orientation
+        aspect_degrees = math.degrees(aspect_radians)
+        
+        # Convert to 0-360 range
+        if aspect_degrees < 0:
+            aspect_degrees += 360
+            
+        return {
+            'slope_degrees': slope_degrees,
+            'aspect_degrees': aspect_degrees
+        }
+    except Exception as e:
+        print(f"Error calculating plane slope: {e}")
+        return {'slope_degrees': 0, 'aspect_degrees': 0}
+
+def find_anomaly_boxes(anomaly_mask):
+    """
+    Find bounding boxes around connected components in anomaly mask
+    
+    Args:
+        anomaly_mask: Binary mask of anomalous pixels
+        
+    Returns:
+        List of bounding boxes as dictionaries with min_x, min_y, max_x, max_y
+    """
+    try:
+        # Ensure mask is proper type for OpenCV
+        if anomaly_mask is None or anomaly_mask.size == 0:
+            print("Anomaly mask is empty or None")
+            return []
+            
+        # Convert boolean mask to uint8 if needed
+        if anomaly_mask.dtype == bool:
+            print("Converting boolean mask to uint8")
+            anomaly_mask = anomaly_mask.astype(np.uint8)
+        
+        # Ensure we have a binary mask (0 or 1 values only)
+        if anomaly_mask.max() > 1:
+            anomaly_mask = (anomaly_mask > 0).astype(np.uint8)
+        
+        # Check if mask has any positive values
+        if np.sum(anomaly_mask) == 0:
+            print("Anomaly mask has no positive values")
+            return []
+            
+        # Find connected components
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(anomaly_mask)
+        
+        print(f"Found {num_labels-1} connected components in anomaly mask")
+        
+        # Filter components by size
+        min_size = 10  # Minimum anomaly size in pixels
+        max_size = max(100, int(0.3 * np.sum(anomaly_mask)))  # Maximum 30% of roof area, at least 100px
+        
+        anomaly_boxes = []
+        for i in range(1, num_labels):  # Skip background (0)
+            size = stats[i, cv2.CC_STAT_AREA]
+            
+            if size < min_size or size > max_size:
+                continue
+                
+            # Get bounding box
+            x = stats[i, cv2.CC_STAT_LEFT]
+            y = stats[i, cv2.CC_STAT_TOP]
+            w = stats[i, cv2.CC_STAT_WIDTH]
+            h = stats[i, cv2.CC_STAT_HEIGHT]
+            
+            # Add some margin
+            margin_x = max(2, int(0.1 * w))
+            margin_y = max(2, int(0.1 * h))
+            
+            x1 = max(0, x - margin_x)
+            y1 = max(0, y - margin_y)
+            x2 = min(anomaly_mask.shape[1] - 1, x + w + margin_x)
+            y2 = min(anomaly_mask.shape[0] - 1, y + h + margin_y)
+            
+            anomaly_boxes.append({
+                'min_x': float(x1),
+                'min_y': float(y1),
+                'max_x': float(x2),
+                'max_y': float(y2),
+                'area': float(size)
+            })
+        
+        print(f"Returning {len(anomaly_boxes)} filtered anomaly boxes")
+        return anomaly_boxes
+    except Exception as e:
+        print(f"Error finding anomaly boxes: {e}")
+        traceback.print_exc()  # Print full stack trace for debugging
+        return []
+
 @router.post("/predict")
 async def predict_roof_segments(request: PredictionRequest):
     global sam_model
@@ -454,6 +610,7 @@ async def predict_roof_segments(request: PredictionRequest):
     print(f"Received request for building_id: {request.building_id}")
     print(f"Building box present: {request.building_box is not None}")
     print(f"Roof segments count: {len(request.roof_segments) if request.roof_segments else 0}")
+    print(f"DSM data present: {request.dsm_data is not None}")
     
     # Initialize model if not already done
     if sam_model is None:
@@ -472,6 +629,37 @@ async def predict_roof_segments(request: PredictionRequest):
             print(f"Decoded image shape: {rgb_image.shape}")
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Failed to decode image: {str(e)}")
+        
+        # Prepare DSM data if available
+        dsm_data = None
+        dsm_2d = None
+        if request.dsm_data is not None:
+            try:
+                # Extract DSM dimensions
+                dsm_width = request.dsm_data.dimensions.get('width')
+                dsm_height = request.dsm_data.dimensions.get('height')
+                rgb_height, rgb_width = rgb_image.shape[:2]
+                
+                if dsm_width and dsm_height and request.dsm_data.elevationData:
+                    # Create 2D array from flattened data
+                    dsm_data = np.array(request.dsm_data.elevationData)
+                    
+                    # Verify dimensions match and reshape
+                    if len(dsm_data) == dsm_width * dsm_height:
+                        # Reshape to 2D array using the provided dimensions
+                        print(f"Reshaping DSM data to {dsm_height}x{dsm_width}")
+                        dsm_2d = dsm_data.reshape(dsm_height, dsm_width)
+                        
+                        # Verify dimensions match the RGB image
+                        if dsm_width != rgb_width or dsm_height != rgb_height:
+                            print(f"⚠️ Warning: DSM dimensions ({dsm_width}x{dsm_height}) don't match RGB dimensions ({rgb_width}x{rgb_height})")
+                    else:
+                        print(f"Error: DSM data length {len(dsm_data)} doesn't match expected dimensions {dsm_width}x{dsm_height}={dsm_width*dsm_height}")
+            except Exception as e:
+                print(f"Error processing DSM data, continuing without it: {e}")
+                traceback.print_exc()
+                dsm_data = None
+                dsm_2d = None
         
         # Set the image for the model
         sam_model.set_image(rgb_image)
@@ -506,9 +694,6 @@ async def predict_roof_segments(request: PredictionRequest):
             
             # Sort by area (largest first)
             roof_segments_with_area.sort(key=lambda s: s['area'], reverse=True)
-            
-            # Store all dominant colors for later comparison
-            all_dominant_colors = []
             
             # Process each roof segment in order of size
             for seg_info in roof_segments_with_area:
@@ -557,29 +742,6 @@ async def predict_roof_segments(request: PredictionRequest):
                 mask, score = select_best_mask(masks, scores, box_prompt, rgb_image.shape[:2])
                 
                 if mask is not None:
-                    # Extract dominant colors from this mask
-                    dominant_colors = extract_dominant_colors(rgb_image, mask, num_colors=2)
-                    
-                    if dominant_colors:
-                        primary_color, primary_percentage = dominant_colors[0]
-                        
-                        # Check if this color is unique compared to already stored colors
-                        color_is_unique = True
-                        for color, _ in all_dominant_colors:
-                            # Calculate color distance
-                            distance = np.sqrt(np.sum((np.array(primary_color) - np.array(color))**2))
-                            if distance < 50:  # Threshold for similar colors
-                                color_is_unique = False
-                                break
-                        
-                        # If this is a small segment with a unique color, it might be an obstruction
-                        if color_is_unique and seg_info['significance'] < 0.1 and len(all_dominant_colors) > 0:
-                            print(f"Skipping segment {segment_id} as potential obstruction (unique color)")
-                            continue
-                        
-                        # Store this color for future comparison
-                        all_dominant_colors.append((primary_color, primary_percentage))
-                    
                     # Convert mask to polygon
                     polygon = mask_to_polygon(mask)
                     
@@ -602,16 +764,8 @@ async def predict_roof_segments(request: PredictionRequest):
                                 'pitch': segment_pitch,
                             }
                             
-                            # Store mask as a separate attribute
+                            # Store mask as a separate attribute for later use
                             segment_result['_mask'] = mask
-                            
-                            if dominant_colors:
-                                segment_result['dominant_color'] = {
-                                    'r': int(primary_color[0]),
-                                    'g': int(primary_color[1]),
-                                    'b': int(primary_color[2]),
-                                    'percentage': float(primary_percentage)
-                                }
                             
                             # Add group information if applicable
                             if is_group:
@@ -658,99 +812,106 @@ async def predict_roof_segments(request: PredictionRequest):
                         'error': 'No valid masks generated by model'
                     })
             
-            # STEP 2: Detect and segment obstructions within each valid roof segment
-            print("Starting obstruction detection phase")
-            
-            obstruction_id_counter = 0
-            for segment in all_roof_segments:
-                # Skip segments without valid polygons or masks
-                if not segment.get('polygon') or len(segment.get('polygon', [])) < 3 or '_mask' not in segment:
-                    continue
+            # STEP 2: Now we use DSM data to detect obstructions within roof segments
+            if dsm_2d is not None:
+                print("Starting DSM-based obstruction detection")
                 
-                mask = segment['_mask']
-                
-                # Get dominant color for this segment
-                dominant_color = None
-                if 'dominant_color' in segment:
-                    dominant_color = (
-                        segment['dominant_color']['r'],
-                        segment['dominant_color']['g'],
-                        segment['dominant_color']['b']
+                obstruction_id_counter = 0
+                for segment in all_roof_segments:
+                    # Skip segments without valid polygons or masks
+                    if not segment.get('polygon') or len(segment.get('polygon', [])) < 3 or '_mask' not in segment:
+                        continue
+                    
+                    segment_id = segment['id']
+                    roof_mask = segment['_mask']
+                    
+                    # Step 2.1: Extract DSM data for this roof segment
+                    segment_dsm_data = extract_dsm_data_from_mask(
+                        dsm_data, roof_mask, dsm_2d.shape[1], dsm_2d.shape[0])
+                    
+                    if segment_dsm_data['count'] < 10:  # Need enough points to fit a plane
+                        print(f"Not enough DSM data points for segment {segment_id}, skipping")
+                        continue
+                    
+                    # Step 2.2: Fit a plane to the DSM data
+                    plane_params, fit_error = fit_plane_to_points(
+                        segment_dsm_data['coordinates'],
+                        segment_dsm_data['elevations']
                     )
-                else:
-                    # If no dominant color stored, extract it from the mask
-                    colors = extract_dominant_colors(rgb_image, mask, num_colors=1)
-                    if colors:
-                        dominant_color = colors[0][0]
-                
-                if dominant_color is None:
-                    continue
-                
-                # Detect color anomalies within this segment
-                anomaly_boxes = detect_color_anomalies(
-                    rgb_image, 
-                    mask, 
-                    dominant_color,
-                    threshold_factor=1.5  # Adjust sensitivity as needed
-                )
-                
-                print(f"Detected {len(anomaly_boxes)} potential obstructions in segment {segment['id']}")
-                
-                # Process each anomaly with SAM to get precise segmentation
-                for anomaly_box in anomaly_boxes:
-                    obstruction_id_counter += 1
-                    obstruction_id = f"obstruction_{obstruction_id_counter}"
                     
-                    # Create box prompt for this obstruction
-                    box_prompt = np.array([
-                        anomaly_box['min_x'], 
-                        anomaly_box['min_y'], 
-                        anomaly_box['max_x'], 
-                        anomaly_box['max_y']
-                    ])
+                    if plane_params is None:
+                        print(f"Failed to fit plane to DSM data for segment {segment_id}")
+                        continue
                     
-                    try:
-                        # Predict with the box prompt
-                        masks, scores, _ = sam_model.predict(box=box_prompt)
+                    # Step 2.3: Calculate slope and aspect of the fitted plane
+                    slope_info = calculate_plane_slope(plane_params)
+                    
+                    # Update segment with calculated slope and aspect
+                    segment['calculated_pitch'] = slope_info['slope_degrees']
+                    segment['calculated_azimuth'] = slope_info['aspect_degrees']
+                    
+                    # Step 2.4: Find elevation anomalies (potential obstructions)
+                    anomaly_mask = calculate_elevation_anomalies(
+                        dsm_2d, roof_mask, plane_params, threshold_factor=1.5)
+                    
+                    # Step 2.5: Find bounding boxes around anomalies
+                    anomaly_boxes = find_anomaly_boxes(anomaly_mask)
+                    
+                    print(f"Detected {len(anomaly_boxes)} potential obstructions in segment {segment_id} using DSM data")
+                    
+                    # Step 2.6: Process each anomaly with SAM to get precise segmentation
+                    for anomaly_box in anomaly_boxes:
+                        obstruction_id_counter += 1
+                        obstruction_id = f"obstruction_{obstruction_id_counter}"
                         
-                        # Take the highest confidence mask
-                        if len(masks) > 0:
-                            best_idx = np.argmax(scores)
-                            obstruction_mask = masks[best_idx]
-                            score = scores[best_idx]
+                        # Create box prompt for this obstruction
+                        box_prompt = np.array([
+                            anomaly_box['min_x'], 
+                            anomaly_box['min_y'], 
+                            anomaly_box['max_x'], 
+                            anomaly_box['max_y']
+                        ])
+                        
+                        try:
+                            # Predict with the box prompt
+                            masks, scores, _ = sam_model.predict(box=box_prompt)
                             
-                            # Make sure the obstruction mask is contained within the segment mask
-                            obstruction_mask = np.logical_and(obstruction_mask, mask).astype(np.uint8)
-                            
-                            if np.sum(obstruction_mask) == 0:
-                                continue  # Skip if no overlap with segment
-                            
-                            # Convert mask to polygon
-                            polygon = mask_to_polygon(obstruction_mask)
-                            
-                            if polygon and len(polygon) >= 3:
-                                # Simplify the polygon
-                                simplified_polygon = simplify_polygon(polygon, tolerance=1.5, max_points=12)
+                            # Take the highest confidence mask
+                            if len(masks) > 0:
+                                best_idx = np.argmax(scores)
+                                obstruction_mask = masks[best_idx]
+                                score = scores[best_idx]
                                 
-                                # Calculate area
-                                area = calculate_area(simplified_polygon)
+                                # Make sure the obstruction mask is contained within the segment mask
+                                obstruction_mask = np.logical_and(obstruction_mask, roof_mask).astype(np.uint8)
                                 
-                                # Add to obstructions list if large enough
-                                if area > 10:  # Smaller threshold for obstructions
-                                    all_obstructions.append({
-                                        'id': obstruction_id,
-                                        'polygon': simplified_polygon,
-                                        'area': area,
-                                        'confidence': float(score),
-                                        'is_obstruction': True,
-                                        'parent_segment': segment['id']
-                                    })
-                    except Exception as e:
-                        print(f"Error processing obstruction {obstruction_id}: {e}")
+                                if np.sum(obstruction_mask) == 0:
+                                    continue  # Skip if no overlap with segment
+                                
+                                # Convert mask to polygon
+                                polygon = mask_to_polygon(obstruction_mask)
+                                
+                                if polygon and len(polygon) >= 3:
+                                    # Calculate area
+                                    area = calculate_area(polygon)
+                                    
+                                    # Add to obstructions list if large enough
+                                    if area > 10:  # Smaller threshold for obstructions
+                                        all_obstructions.append({
+                                            'id': obstruction_id,
+                                            'polygon': polygon,
+                                            'area': area,
+                                            'confidence': float(score),
+                                            'is_obstruction': True,
+                                            'parent_segment': segment_id,
+                                            'elevation_diff': float(anomaly_box.get('elevation_diff', 0.0))
+                                        })
+                        except Exception as e:
+                            print(f"Error processing obstruction {obstruction_id}: {e}")
+            else:
+                print("No DSM data available for obstruction detection")
             
-            # STEP 3: Mark roof segments with obstructions and remove obstruction masks from roof segments
-            print("Finalizing roof segments and removing obstructions")
-            
+            # STEP 3: Mark roof segments with obstructions
             for segment in all_roof_segments:
                 # Find obstructions belonging to this segment
                 segment_obstructions = [o for o in all_obstructions if o.get('parent_segment') == segment.get('id')]
@@ -758,9 +919,6 @@ async def predict_roof_segments(request: PredictionRequest):
                 if segment_obstructions:
                     segment['has_obstruction'] = True
                     segment['obstruction_count'] = len(segment_obstructions)
-                    
-                    # Clean up segment polygon by removing obstructions
-                    # This will be handled by resolve_overlaps_simple
             
             # Resolve overlaps between segments
             all_roof_segments = resolve_overlaps_simple(all_roof_segments)
@@ -784,11 +942,10 @@ async def predict_roof_segments(request: PredictionRequest):
             "num_obstructions": len(all_obstructions),
             "used_roof_segments": request.roof_segments is not None and len(request.roof_segments) > 0,
             "used_building_box": request.building_box is not None,
-            "used_color_analysis": True
+            "used_dsm_data": dsm_data is not None
         }
     except Exception as e:
         # Log the full error details
-        import traceback
         print(f"Error processing image: {str(e)}")
-        print(traceback.format_exc())
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error processing image: {str(e)}")
