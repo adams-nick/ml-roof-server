@@ -417,8 +417,8 @@ async def predict_roof_segments(request: PredictionRequest):
                     
                     if polygon and len(polygon) >= 3:
                         # Simplify the polygon to use straight lines and fewer points
-                        simplified_polygon = simplify_polygon(polygon, tolerance=2.0, max_points=8)
-                        
+                        #simplified_polygon = simplify_polygon(polygon, tolerance=2.0, max_points=8)
+                        simplified_polygon = polygon
                         # Calculate segment area (use the simplified polygon)
                         segment_area = calculate_area(simplified_polygon)
                         
